@@ -23,3 +23,9 @@ next-env.d.ts
 # Test output
 coverage/
 playwright-report/
+
+# Local spec & planning docs
+CLAUDE.md
+docs/
+*.pdf
+firebase-debug.log
