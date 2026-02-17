@@ -2,6 +2,8 @@ import type { NextConfig } from 'next'
 import path from 'path'
 
 const nextConfig: NextConfig = {
+  // tiktoken and pdf-parse use WASM / native binaries that must not be bundled
+  serverExternalPackages: ['tiktoken', 'pdf-parse'],
   turbopack: {
     root: path.resolve(__dirname),
   },
