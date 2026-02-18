@@ -343,6 +343,56 @@ export type Database = {
             foreignKeyName: "eval_sets_workspace_id_fkey"
             columns: ["workspace_id"]
             isOneToOne: false
+            referencedRelation: "eval_sets"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      invitations: {
+        Row: {
+          created_at: string | null
+          email: string
+          expires_at: string
+          id: string
+          invite_count: number | null
+          invited_by: string
+          last_sent_at: string | null
+          reminder_sent_at: string | null
+          role: Database["public"]["Enums"]["member_role"]
+          token: string | null
+          workspace_id: string
+        }
+        Insert: {
+          created_at?: string | null
+          email: string
+          expires_at?: string
+          id?: string
+          invite_count?: number | null
+          invited_by: string
+          last_sent_at?: string | null
+          reminder_sent_at?: string | null
+          role?: Database["public"]["Enums"]["member_role"]
+          token?: string | null
+          workspace_id: string
+        }
+        Update: {
+          created_at?: string | null
+          email?: string
+          expires_at?: string
+          id?: string
+          invite_count?: number | null
+          invited_by?: string
+          last_sent_at?: string | null
+          reminder_sent_at?: string | null
+          role?: Database["public"]["Enums"]["member_role"]
+          token?: string | null
+          workspace_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "invitations_workspace_id_fkey"
+            columns: ["workspace_id"]
+            isOneToOne: false
             referencedRelation: "workspaces"
             referencedColumns: ["id"]
           },
@@ -411,6 +461,30 @@ export type Database = {
             referencedColumns: ["id"]
           },
         ]
+      }
+      profiles: {
+        Row: {
+          created_at: string | null
+          email: string
+          first_name: string | null
+          id: string
+          last_name: string | null
+        }
+        Insert: {
+          created_at?: string | null
+          email: string
+          first_name?: string | null
+          id: string
+          last_name?: string | null
+        }
+        Update: {
+          created_at?: string | null
+          email?: string
+          first_name?: string | null
+          id?: string
+          last_name?: string | null
+        }
+        Relationships: []
       }
       ticket_messages: {
         Row: {
