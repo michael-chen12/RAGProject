@@ -3,53 +3,40 @@ import { createClient, createServiceClient } from '@/lib/supabase/server'
 import { getMembership } from '@/lib/queries/workspaces'
 import { getCollection } from '@/lib/queries/collections'
 import { requireRole } from '@/lib/auth/guards'
+import { withErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
 
-type RouteContext = { params: Promise<{ id: string; collectionId: string }> }
+type RouteContext = { params?: Promise<Record<string, string>> }
 
-/**
- * DELETE /api/workspaces/[id]/collections/[collectionId]
- *
- * Deletes a collection. Requires admin role.
- *
- * FK behavior: documents.collection_id has ON DELETE SET NULL, so documents
- * are NOT deleted — they become "uncollected" and reappear on the /kb page.
- * document_chunks are also preserved. Only the collection row is removed.
- */
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
-  const { id: workspaceId, collectionId } = await params
+async function handleDelete(req: NextRequest, { params }: RouteContext) {
+  const { id: workspaceId, collectionId } = ((await params) ?? {}) as Record<string, string>
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
 
   const userSupabase = await createClient()
-  const {
-    data: { user },
-  } = await userSupabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  const { data: { user } } = await userSupabase.auth.getUser()
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id, workspaceId })
 
   const membership = await getMembership(userSupabase, workspaceId, user.id)
-  if (!membership) {
-    return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
-  }
+  if (!membership) throw Errors.notFound('Workspace not found')
 
   try {
     requireRole(membership.role, 'admin')
   } catch {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    throw Errors.forbidden()
   }
 
-  // Verify collection belongs to this workspace (RLS + explicit check)
   const collection = await getCollection(userSupabase, collectionId)
   if (!collection || collection.workspace_id !== workspaceId) {
-    return NextResponse.json({ error: 'Collection not found' }, { status: 404 })
+    throw Errors.notFound('Collection not found')
   }
 
   const service = createServiceClient()
   const { error } = await service.from('collections').delete().eq('id', collectionId)
-
-  if (error) {
-    return NextResponse.json({ error: 'Failed to delete collection' }, { status: 500 })
-  }
+  if (error) throw Errors.internal('Failed to delete collection')
 
   return NextResponse.json({ success: true })
 }
+
+export const DELETE = withErrorHandler(handleDelete)

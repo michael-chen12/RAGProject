@@ -1,12 +1,37 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { PDFParse } from 'pdf-parse'
-import { createServiceClient } from '@/lib/supabase/server'
+import { createClient, createServiceClient } from '@/lib/supabase/server'
 import { chunkDocument } from '@/lib/rag/ingest'
 import { embedChunks } from '@/lib/openai/embeddings'
+import { Ratelimit } from '@upstash/ratelimit'
+import { Redis } from '@upstash/redis'
+import { withErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
 
-type RouteContext = { params: Promise<{ documentId: string }> }
+type RouteContext = { params?: Promise<Record<string, string>> }
 
 const CHUNK_INSERT_BATCH = 500
+
+// 10 ingest requests per user per hour (per PRODUCT_SPEC Feature 10)
+let ingestRatelimit: Ratelimit | null = null
+
+function getIngestRatelimit(): Ratelimit | null {
+  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return null
+  }
+  if (!ingestRatelimit) {
+    ingestRatelimit = new Ratelimit({
+      redis: new Redis({
+        url: process.env.UPSTASH_REDIS_REST_URL,
+        token: process.env.UPSTASH_REDIS_REST_TOKEN,
+      }),
+      limiter: Ratelimit.slidingWindow(10, '1h'),
+      prefix: 'rag:ingest',
+    })
+  }
+  return ingestRatelimit
+}
 
 /**
  * POST /api/ingest/[documentId]
@@ -20,8 +45,26 @@ const CHUNK_INSERT_BATCH = 500
  * On any error the document status is set to 'failed' with an error_message,
  * and any partial chunks inserted in this run are deleted to avoid orphans.
  */
-export async function POST(_req: NextRequest, { params }: RouteContext) {
-  const { documentId } = await params
+async function handlePost(req: NextRequest, { params }: RouteContext) {
+  const { documentId } = ((await params) ?? {}) as Record<string, string>
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
+
+  // Auth check — needed for rate limiting by userId
+  const userSupabase = await createClient()
+  const { data: { user } } = await userSupabase.auth.getUser()
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id })
+
+  // Rate limiting: 10 ingest requests per user per hour
+  const rl = getIngestRatelimit()
+  if (rl) {
+    const { success, reset } = await rl.limit(user.id)
+    if (!success) {
+      const retryAfter = Math.ceil((reset - Date.now()) / 1000)
+      throw Errors.rateLimited(retryAfter)
+    }
+  }
+
   const service = createServiceClient()
 
   // 1. Fetch document record so we know the storage path and workspace
@@ -31,9 +74,9 @@ export async function POST(_req: NextRequest, { params }: RouteContext) {
     .eq('id', documentId)
     .single()
 
-  if (fetchError || !doc) {
-    return NextResponse.json({ error: 'Document not found' }, { status: 404 })
-  }
+  if (fetchError || !doc) throw Errors.notFound('Document not found')
+
+  setLogContext(requestId, { workspaceId: doc.workspace_id })
 
   try {
     // 2. Download file from private Storage bucket
@@ -112,6 +155,9 @@ export async function POST(_req: NextRequest, { params }: RouteContext) {
       .update({ status: 'failed', error_message: message })
       .eq('id', documentId)
 
-    return NextResponse.json({ error: message }, { status: 500 })
+    // Re-throw so withErrorHandler returns a 500 with INTERNAL_ERROR code
+    throw Errors.internal(message)
   }
 }
+
+export const POST = withErrorHandler(handlePost)

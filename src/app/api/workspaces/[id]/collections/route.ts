@@ -3,84 +3,57 @@ import { createClient, createServiceClient } from '@/lib/supabase/server'
 import { getMembership } from '@/lib/queries/workspaces'
 import { getCollections } from '@/lib/queries/collections'
 import { requireRole } from '@/lib/auth/guards'
+import { withErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
 
-type RouteContext = { params: Promise<{ id: string }> }
+type RouteContext = { params?: Promise<Record<string, string>> }
 
-/**
- * GET /api/workspaces/[id]/collections
- *
- * Returns all collections the caller can see. Viewers only see public ones
- * (filtered in getCollections via app-layer, not RLS). Each collection
- * includes a doc_count of documents in it.
- */
-export async function GET(_req: NextRequest, { params }: RouteContext) {
-  const { id: workspaceId } = await params
+async function handleGet(req: NextRequest, { params }: RouteContext) {
+  const { id: workspaceId } = ((await params) ?? {}) as Record<string, string>
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
 
   const userSupabase = await createClient()
-  const {
-    data: { user },
-  } = await userSupabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  const { data: { user } } = await userSupabase.auth.getUser()
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id, workspaceId })
 
   const membership = await getMembership(userSupabase, workspaceId, user.id)
-  if (!membership) {
-    return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
-  }
+  if (!membership) throw Errors.notFound('Workspace not found')
 
   const collections = await getCollections(userSupabase, workspaceId, membership.role)
-
   return NextResponse.json(collections)
 }
 
-/**
- * POST /api/workspaces/[id]/collections
- *
- * Creates a new collection in the workspace. Requires agent or admin role.
- *
- * Body: { name: string; visibility?: 'public' | 'private' }
- * Response: the newly created collection row (201)
- */
-export async function POST(req: NextRequest, { params }: RouteContext) {
-  const { id: workspaceId } = await params
+async function handlePost(req: NextRequest, { params }: RouteContext) {
+  const { id: workspaceId } = ((await params) ?? {}) as Record<string, string>
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
 
   const userSupabase = await createClient()
-  const {
-    data: { user },
-  } = await userSupabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  const { data: { user } } = await userSupabase.auth.getUser()
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id, workspaceId })
 
   const membership = await getMembership(userSupabase, workspaceId, user.id)
-  if (!membership) {
-    return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
-  }
+  if (!membership) throw Errors.notFound('Workspace not found')
 
   try {
     requireRole(membership.role, 'agent')
   } catch {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    throw Errors.forbidden()
   }
 
   let name: string, visibility: 'public' | 'private'
   try {
     const body = await req.json()
     name = (body.name ?? '').trim()
-    // Default to public if not explicitly 'private'
     visibility = body.visibility === 'private' ? 'private' : 'public'
   } catch {
-    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
+    throw Errors.invalidJson()
   }
 
-  if (!name) {
-    return NextResponse.json({ error: 'name is required' }, { status: 400 })
-  }
+  if (!name) throw Errors.validation('name is required')
 
-  // Service client for the write (bypasses RLS, never exposed to browser)
   const service = createServiceClient()
   const { data: collection, error } = await service
     .from('collections')
@@ -88,9 +61,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     .select('*')
     .single()
 
-  if (error || !collection) {
-    return NextResponse.json({ error: 'Failed to create collection' }, { status: 500 })
-  }
+  if (error || !collection) throw Errors.internal('Failed to create collection')
 
   return NextResponse.json(collection, { status: 201 })
 }
+
+export const GET = withErrorHandler(handleGet)
+export const POST = withErrorHandler(handlePost)

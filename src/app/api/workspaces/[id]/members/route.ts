@@ -2,41 +2,36 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createClient, createServiceClient } from '@/lib/supabase/server'
 import { requireWorkspaceMember } from '@/lib/auth/guards'
 import { getProfilesByIds } from '@/lib/queries/profiles'
+import { withErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
+import logger from '@/lib/api/logger'
 
-type RouteContext = { params: Promise<{ id: string }> }
+type RouteContext = { params?: Promise<Record<string, string>> }
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const VALID_ROLES = ['admin', 'agent', 'viewer'] as const
 const MAX_INVITES_PER_HOUR = 5
 
-// GET /api/workspaces/[id]/members — list members with profile data
-export async function GET(_req: NextRequest, { params }: RouteContext) {
-  const { id } = await params
+async function handleGet(req: NextRequest, { params }: RouteContext) {
+  const { id } = ((await params) ?? {}) as Record<string, string>
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
 
   const userSupabase = await createClient()
-  const {
-    data: { user },
-  } = await userSupabase.auth.getUser()
+  const { data: { user } } = await userSupabase.auth.getUser()
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id, workspaceId: id })
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  // Verify caller is a member of this workspace
   await requireWorkspaceMember(userSupabase, id, user.id)
 
-  // Fetch memberships
   const { data: memberships, error } = await userSupabase
     .from('memberships')
     .select('id, role, user_id, created_at')
     .eq('workspace_id', id)
     .order('created_at', { ascending: true })
 
-  if (error) {
-    return NextResponse.json({ error: 'Failed to fetch members' }, { status: 500 })
-  }
+  if (error) throw Errors.internal('Failed to fetch members')
 
-  // Fetch profiles for all member user IDs and merge
   const userIds = memberships?.map((m) => m.user_id) ?? []
   const profiles = await getProfilesByIds(userSupabase, userIds)
   const profileMap = new Map(profiles.map((p) => [p.id, p]))
@@ -54,18 +49,15 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
   return NextResponse.json(members)
 }
 
-// POST /api/workspaces/[id]/members — invite a new member by email
-export async function POST(req: NextRequest, { params }: RouteContext) {
-  const { id: workspaceId } = await params
+async function handlePost(req: NextRequest, { params }: RouteContext) {
+  const { id: workspaceId } = ((await params) ?? {}) as Record<string, string>
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
 
-  // 1. Auth check
   const userSupabase = await createClient()
   const { data: { user } } = await userSupabase.auth.getUser()
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id, workspaceId })
 
-  // 2. Verify admin role
   const { data: membership } = await userSupabase
     .from('memberships')
     .select('role')
@@ -73,31 +65,25 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     .eq('user_id', user.id)
     .single()
 
-  if (!membership || membership.role !== 'admin') {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
+  if (!membership || membership.role !== 'admin') throw Errors.forbidden()
 
-  // 3. Parse and validate body
   let email: string, role: string
   try {
     const body = await req.json()
     email = (body.email ?? '').trim().toLowerCase()
     role = body.role ?? 'viewer'
   } catch {
-    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
+    throw Errors.invalidJson()
   }
 
-  if (!EMAIL_REGEX.test(email)) {
-    return NextResponse.json({ error: 'Invalid email format' }, { status: 400 })
-  }
-
+  if (!EMAIL_REGEX.test(email)) throw Errors.validation('Invalid email format')
   if (!VALID_ROLES.includes(role as typeof VALID_ROLES[number])) {
-    return NextResponse.json({ error: 'Invalid role' }, { status: 400 })
+    throw Errors.validation('Invalid role')
   }
 
   const serviceClient = createServiceClient()
 
-  // 4. Rate limiting — max 5 invites per hour per workspace
+  // Rate limiting — max 5 invites per hour per workspace
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString()
   const { count } = await serviceClient
     .from('invitations')
@@ -106,10 +92,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     .gte('created_at', oneHourAgo)
 
   if ((count ?? 0) >= MAX_INVITES_PER_HOUR) {
-    return NextResponse.json({ error: 'Rate limit exceeded. Try again later.' }, { status: 429 })
+    throw Errors.rateLimited(3600)
   }
 
-  // 5. Check if already a member (return success silently to prevent email enumeration)
+  // Check if already a member (return success silently to prevent email enumeration)
   const { data: existingProfile } = await serviceClient
     .from('profiles')
     .select('id')
@@ -129,7 +115,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     }
   }
 
-  // 6. Check if invitation already pending (return success silently)
+  // Check if invitation already pending (return success silently)
   const { data: existingInvite } = await serviceClient
     .from('invitations')
     .select('id')
@@ -141,7 +127,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     return NextResponse.json({ success: true, message: 'Invitation sent' })
   }
 
-  // 7. Create invitation record
+  // Create invitation record
   const { error: insertError } = await serviceClient
     .from('invitations')
     .insert({
@@ -152,11 +138,11 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     })
 
   if (insertError) {
-    console.error('Failed to create invitation:', insertError)
-    return NextResponse.json({ error: 'Failed to send invitation' }, { status: 500 })
+    logger.error({ err: insertError, workspaceId, email }, 'Failed to create invitation')
+    throw Errors.internal('Failed to send invitation')
   }
 
-  // 8. Send invite email via Supabase Auth admin API
+  // Send invite email via Supabase Auth admin API
   const origin = req.headers.get('origin') ?? process.env.NEXT_PUBLIC_APP_URL
   await serviceClient.auth.admin.inviteUserByEmail(email, {
     redirectTo: `${origin}/auth/callback`,
@@ -164,3 +150,6 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
 
   return NextResponse.json({ success: true, message: 'Invitation sent' })
 }
+
+export const GET = withErrorHandler(handleGet)
+export const POST = withErrorHandler(handlePost)

@@ -1,14 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
+import { withErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
 
 // GET /api/profile — get the current user's profile
-export async function GET() {
+async function handleGet(req: NextRequest) {
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id })
 
   const { data } = await supabase
     .from('profiles')
@@ -20,19 +23,19 @@ export async function GET() {
 }
 
 // PATCH /api/profile — update first_name and/or last_name
-export async function PATCH(req: NextRequest) {
+async function handlePatch(req: NextRequest) {
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
 
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id })
 
   let updates: { first_name?: string; last_name?: string }
   try {
     updates = await req.json()
   } catch {
-    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
+    throw Errors.invalidJson()
   }
 
   // Whitelist — only allow updating display name fields
@@ -45,7 +48,7 @@ export async function PATCH(req: NextRequest) {
   }
 
   if (Object.keys(allowedUpdates).length === 0) {
-    return NextResponse.json({ error: 'No valid fields to update' }, { status: 400 })
+    throw Errors.validation('No valid fields to update')
   }
 
   const { data, error } = await supabase
@@ -55,9 +58,10 @@ export async function PATCH(req: NextRequest) {
     .select()
     .single()
 
-  if (error) {
-    return NextResponse.json({ error: 'Failed to update profile' }, { status: 500 })
-  }
+  if (error) throw Errors.internal('Failed to update profile')
 
   return NextResponse.json(data)
 }
+
+export const GET = withErrorHandler(handleGet)
+export const PATCH = withErrorHandler(handlePatch)

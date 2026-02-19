@@ -1,21 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient, createServiceClient } from '@/lib/supabase/server'
+import { withErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
 
-type RouteContext = { params: Promise<{ id: string; userId: string }> }
+type RouteContext = { params?: Promise<Record<string, string>> }
 
 const VALID_ROLES = ['admin', 'agent', 'viewer'] as const
 
-// PATCH /api/workspaces/[id]/members/[userId] — change a member's role
-export async function PATCH(req: NextRequest, { params }: RouteContext) {
-  const { id: workspaceId, userId: targetUserId } = await params
+async function handlePatch(req: NextRequest, { params }: RouteContext) {
+  const { id: workspaceId, userId: targetUserId } = ((await params) ?? {}) as Record<string, string>
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
 
   const userSupabase = await createClient()
   const { data: { user } } = await userSupabase.auth.getUser()
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id, workspaceId })
 
-  // Verify caller is admin
   const { data: membership } = await userSupabase
     .from('memberships')
     .select('role')
@@ -23,29 +24,24 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     .eq('user_id', user.id)
     .single()
 
-  if (!membership || membership.role !== 'admin') {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
+  if (!membership || membership.role !== 'admin') throw Errors.forbidden()
 
-  // Prevent self-modification
   if (targetUserId === user.id) {
-    return NextResponse.json({ error: 'Cannot modify your own role' }, { status: 400 })
+    throw Errors.validation('Cannot modify your own role')
   }
 
-  // Parse body
   let newRole: string
   try {
     const body = await req.json()
     newRole = body.role
   } catch {
-    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
+    throw Errors.invalidJson()
   }
 
   if (!VALID_ROLES.includes(newRole as typeof VALID_ROLES[number])) {
-    return NextResponse.json({ error: 'Invalid role' }, { status: 400 })
+    throw Errors.validation('Invalid role')
   }
 
-  // Update role using service client to bypass RLS
   const serviceClient = createServiceClient()
   const { data: updated, error } = await serviceClient
     .from('memberships')
@@ -55,24 +51,20 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     .select()
     .single()
 
-  if (error || !updated) {
-    return NextResponse.json({ error: 'Failed to update role' }, { status: 500 })
-  }
+  if (error || !updated) throw Errors.internal('Failed to update role')
 
   return NextResponse.json(updated)
 }
 
-// DELETE /api/workspaces/[id]/members/[userId] — remove a member
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
-  const { id: workspaceId, userId: targetUserId } = await params
+async function handleDelete(req: NextRequest, { params }: RouteContext) {
+  const { id: workspaceId, userId: targetUserId } = ((await params) ?? {}) as Record<string, string>
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
 
   const userSupabase = await createClient()
   const { data: { user } } = await userSupabase.auth.getUser()
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id, workspaceId })
 
-  // Verify caller is admin
   const { data: membership } = await userSupabase
     .from('memberships')
     .select('role')
@@ -80,13 +72,10 @@ export async function DELETE(_req: NextRequest, { params }: RouteContext) {
     .eq('user_id', user.id)
     .single()
 
-  if (!membership || membership.role !== 'admin') {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
+  if (!membership || membership.role !== 'admin') throw Errors.forbidden()
 
-  // Prevent self-removal
   if (targetUserId === user.id) {
-    return NextResponse.json({ error: 'Cannot remove yourself' }, { status: 400 })
+    throw Errors.validation('Cannot remove yourself')
   }
 
   const serviceClient = createServiceClient()
@@ -106,7 +95,7 @@ export async function DELETE(_req: NextRequest, { params }: RouteContext) {
     .single()
 
   if (targetMember?.role === 'admin' && (adminCount ?? 0) <= 1) {
-    return NextResponse.json({ error: 'Cannot remove the last admin' }, { status: 400 })
+    throw Errors.validation('Cannot remove the last admin')
   }
 
   const { error } = await serviceClient
@@ -115,9 +104,10 @@ export async function DELETE(_req: NextRequest, { params }: RouteContext) {
     .eq('workspace_id', workspaceId)
     .eq('user_id', targetUserId)
 
-  if (error) {
-    return NextResponse.json({ error: 'Failed to remove member' }, { status: 500 })
-  }
+  if (error) throw Errors.internal('Failed to remove member')
 
   return NextResponse.json({ success: true })
 }
+
+export const PATCH = withErrorHandler(handlePatch)
+export const DELETE = withErrorHandler(handleDelete)

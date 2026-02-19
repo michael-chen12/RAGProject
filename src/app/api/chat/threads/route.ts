@@ -1,19 +1,22 @@
+import { NextRequest } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
+import { withErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
 
-export async function GET(request: Request) {
-  // Auth check
+async function handleGet(req: NextRequest) {
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
-  if (!user) {
-    return Response.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id })
 
   // Parse workspaceId from query string
-  const { searchParams } = new URL(request.url)
+  const { searchParams } = new URL(req.url)
   const workspaceId = searchParams.get('workspaceId')
-  if (!workspaceId) {
-    return Response.json({ error: 'workspaceId query parameter is required' }, { status: 400 })
-  }
+  if (!workspaceId) throw Errors.validation('workspaceId query parameter is required')
+
+  setLogContext(requestId, { workspaceId })
 
   // Membership check — verifies the user belongs to this workspace
   const { data: membership } = await supabase
@@ -23,9 +26,7 @@ export async function GET(request: Request) {
     .eq('user_id', user.id)
     .single()
 
-  if (!membership) {
-    return Response.json({ error: 'Forbidden' }, { status: 403 })
-  }
+  if (!membership) throw Errors.forbidden()
 
   // Fetch threads for this user + workspace, newest first
   const { data: threads } = await supabase
@@ -37,3 +38,5 @@ export async function GET(request: Request) {
 
   return Response.json({ threads: threads ?? [] })
 }
+
+export const GET = withErrorHandler(handleGet)

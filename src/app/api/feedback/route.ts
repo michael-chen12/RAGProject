@@ -1,24 +1,26 @@
+import { NextRequest } from 'next/server'
 import { createClient, createServiceClient } from '@/lib/supabase/server'
+import { withErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
 
-export async function POST(request: Request) {
-  // Auth check
+async function handlePost(req: NextRequest) {
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
-  if (!user) {
-    return Response.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id })
 
-  // Parse body
   let body: { messageId: string; rating: 'up' | 'down' }
   try {
-    body = await request.json()
+    body = await req.json()
   } catch {
-    return Response.json({ error: 'Invalid JSON' }, { status: 400 })
+    throw Errors.invalidJson()
   }
 
   const { messageId, rating } = body
   if (!messageId || !['up', 'down'].includes(rating)) {
-    return Response.json({ error: 'messageId and rating (up|down) are required' }, { status: 400 })
+    throw Errors.validation('messageId and rating (up|down) are required')
   }
 
   // Verify the message is accessible to this user:
@@ -30,9 +32,7 @@ export async function POST(request: Request) {
     .eq('chat_threads.user_id', user.id)
     .single()
 
-  if (!message) {
-    return Response.json({ error: 'Message not found or access denied' }, { status: 403 })
-  }
+  if (!message) throw Errors.forbidden('Message not found or access denied')
 
   // Upsert feedback — UNIQUE(message_id, user_id) handles re-votes
   const serviceClient = createServiceClient()
@@ -43,9 +43,9 @@ export async function POST(request: Request) {
       { onConflict: 'message_id,user_id' }
     )
 
-  if (error) {
-    return Response.json({ error: 'Failed to save feedback' }, { status: 500 })
-  }
+  if (error) throw Errors.internal('Failed to save feedback')
 
   return Response.json({ ok: true })
 }
+
+export const POST = withErrorHandler(handlePost)

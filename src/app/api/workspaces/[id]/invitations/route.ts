@@ -1,19 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
+import { withErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
 
-type RouteContext = { params: Promise<{ id: string }> }
+type RouteContext = { params?: Promise<Record<string, string>> }
 
-// GET /api/workspaces/[id]/invitations — list pending invitations (admin only)
-export async function GET(_req: NextRequest, { params }: RouteContext) {
-  const { id: workspaceId } = await params
+async function handleGet(req: NextRequest, { params }: RouteContext) {
+  const { id: workspaceId } = ((await params) ?? {}) as Record<string, string>
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
 
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id, workspaceId })
 
-  // Verify admin
   const { data: membership } = await supabase
     .from('memberships')
     .select('role')
@@ -21,9 +22,7 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
     .eq('user_id', user.id)
     .single()
 
-  if (!membership || membership.role !== 'admin') {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
+  if (!membership || membership.role !== 'admin') throw Errors.forbidden()
 
   const { data, error } = await supabase
     .from('invitations')
@@ -32,9 +31,9 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
     .gt('expires_at', new Date().toISOString())
     .order('created_at', { ascending: false })
 
-  if (error) {
-    return NextResponse.json({ error: 'Failed to fetch invitations' }, { status: 500 })
-  }
+  if (error) throw Errors.internal('Failed to fetch invitations')
 
   return NextResponse.json(data)
 }
+
+export const GET = withErrorHandler(handleGet)
