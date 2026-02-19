@@ -29,3 +29,6 @@ CLAUDE.md
 docs/
 *.pdf
 firebase-debug.log
+
+# Git worktrees
+.worktrees/

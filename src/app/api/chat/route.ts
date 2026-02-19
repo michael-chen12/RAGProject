@@ -1,4 +1,4 @@
-import { after } from 'next/server'
+import { NextRequest, after } from 'next/server'
 import { createClient, createServiceClient } from '@/lib/supabase/server'
 import { Ratelimit } from '@upstash/ratelimit'
 import { Redis } from '@upstash/redis'
@@ -6,10 +6,12 @@ import { embedText } from '@/lib/openai/embeddings'
 import { retrieveChunks } from '@/lib/rag/retrieval'
 import { buildSystemPrompt } from '@/lib/rag/prompt'
 import { streamChatResponse } from '@/lib/openai/chat'
+import { withStreamingErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
 
 // Sliding window: 20 requests per 60 seconds per user
-// This must be initialized lazily (not at module level) to avoid crashing
-// when UPSTASH env vars are not set in development/test environments.
+// Initialized lazily to avoid crashing when UPSTASH env vars are not set.
 let ratelimit: Ratelimit | null = null
 
 function getRatelimit(): Ratelimit | null {
@@ -29,33 +31,30 @@ function getRatelimit(): Ratelimit | null {
   return ratelimit
 }
 
-export async function POST(request: Request) {
-  // ── Step a: Auth ──────────────────────────────────────────────────────────
+async function handlePost(request: NextRequest) {
+  const requestId = request.headers.get('x-internal-request-id') ?? ''
+
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
-  if (!user) {
-    return Response.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id })
 
-  // ── Step b: Parse body ────────────────────────────────────────────────────
   let body: { workspaceId: string; message: string; threadId?: string; ephemeral?: boolean }
   try {
     body = await request.json()
   } catch {
-    return Response.json({ error: 'Invalid JSON' }, { status: 400 })
+    throw Errors.invalidJson()
   }
 
   const { workspaceId, message, threadId: requestedThreadId, ephemeral = false } = body
   if (!workspaceId || typeof workspaceId !== 'string') {
-    return Response.json({ error: 'workspaceId is required' }, { status: 400 })
+    throw Errors.validation('workspaceId is required')
   }
   if (!message || typeof message !== 'string' || message.trim().length === 0) {
-    return Response.json({ error: 'message is required' }, { status: 400 })
+    throw Errors.validation('message is required')
   }
 
-  // ── Step c: Workspace membership check ───────────────────────────────────
   // workspaceId is taken from the validated membership, NOT the request body.
-  // This prevents workspace spoofing attacks.
   const { data: membership } = await supabase
     .from('memberships')
     .select('workspace_id, role')
@@ -63,38 +62,26 @@ export async function POST(request: Request) {
     .eq('user_id', user.id)
     .single()
 
-  if (!membership) {
-    return Response.json({ error: 'Forbidden' }, { status: 403 })
-  }
+  if (!membership) throw Errors.forbidden()
 
-  // Use validated workspaceId from membership (not request body)
   const validatedWorkspaceId = membership.workspace_id
+  setLogContext(requestId, { workspaceId: validatedWorkspaceId })
 
-  // ── Step d: Rate limiting ─────────────────────────────────────────────────
+  // Rate limiting
   const rl = getRatelimit()
   if (rl) {
     const { success, reset } = await rl.limit(user.id)
     if (!success) {
       const retryAfter = Math.ceil((reset - Date.now()) / 1000)
-      return Response.json(
-        { error: 'Too many requests' },
-        {
-          status: 429,
-          headers: { 'Retry-After': String(retryAfter) },
-        }
-      )
+      throw Errors.rateLimited(retryAfter)
     }
   }
 
-  // ── Step e/f: Thread resolution ───────────────────────────────────────────
-  // serviceClient is declared OUTSIDE the ephemeral gate — it's also needed
-  // for retrieveChunks (the SECURITY DEFINER RPC requires service-role access).
   const serviceClient = createServiceClient()
-  let threadId = ''  // empty string for ephemeral mode (not used downstream)
+  let threadId = ''
 
   if (!ephemeral) {
     if (requestedThreadId) {
-      // Verify thread belongs to this user + workspace
       const { data: existingThread } = await serviceClient
         .from('chat_threads')
         .select('id')
@@ -103,12 +90,9 @@ export async function POST(request: Request) {
         .eq('workspace_id', validatedWorkspaceId)
         .single()
 
-      if (!existingThread) {
-        return Response.json({ error: 'Thread not found or access denied' }, { status: 403 })
-      }
+      if (!existingThread) throw Errors.forbidden('Thread not found or access denied')
       threadId = existingThread.id
     } else {
-      // Create a new thread with a title derived from the first message
       const title = message.slice(0, 50)
       const { data: newThread, error: threadError } = await serviceClient
         .from('chat_threads')
@@ -120,14 +104,11 @@ export async function POST(request: Request) {
         .select('id')
         .single()
 
-      if (threadError || !newThread) {
-        return Response.json({ error: 'Failed to create thread' }, { status: 500 })
-      }
+      if (threadError || !newThread) throw Errors.internal('Failed to create thread')
       threadId = newThread.id
     }
   }
 
-  // ── Steps g-i: RAG pipeline ───────────────────────────────────────────────
   const queryEmbedding = await embedText(message)
   const chunks = await retrieveChunks(serviceClient, validatedWorkspaceId, queryEmbedding, {
     k: 8,
@@ -135,12 +116,10 @@ export async function POST(request: Request) {
   })
   const { systemPrompt, citationMap } = buildSystemPrompt(chunks)
 
-  // ── Step j: Stream from LLM ───────────────────────────────────────────────
   const textStream = await streamChatResponse(systemPrompt, message)
   const encoder = new TextEncoder()
   let fullText = ''
 
-  // ── Step k: Build custom SSE ReadableStream ───────────────────────────────
   const sseStream = new ReadableStream({
     async start(controller) {
       try {
@@ -151,7 +130,6 @@ export async function POST(request: Request) {
           fullText += value
           controller.enqueue(encoder.encode(`data: ${value}\n\n`))
         }
-        // After all tokens: emit the citations event
         controller.enqueue(
           encoder.encode(`data: [CITATIONS]${JSON.stringify(citationMap)}\n\n`)
         )
@@ -161,8 +139,7 @@ export async function POST(request: Request) {
     },
   })
 
-  // ── Step m: Persist messages after streaming (non-blocking) ──────────────
-  // Ephemeral mode: skip persistence entirely — no thread, no messages stored.
+  // Persist messages after streaming (non-blocking)
   if (!ephemeral) after(async () => {
     const maxSimilarity = chunks.length > 0
       ? Math.max(...chunks.map((c) => c.similarity))
@@ -174,14 +151,12 @@ export async function POST(request: Request) {
         thread_id: threadId,
         role: 'assistant' as const,
         content: fullText,
-        // Cast to Json — CitationEntry is a plain object that satisfies the Json shape at runtime
         citations: citationMap.length > 0
           ? (citationMap as unknown as import('@/types/database.types').Json)
           : null,
       },
     ])
 
-    // Log low-confidence queries for KB gap analysis
     if (maxSimilarity < 0.6) {
       await serviceClient.from('missing_kb_entries').insert({
         workspace_id: validatedWorkspaceId,
@@ -191,13 +166,13 @@ export async function POST(request: Request) {
     }
   })
 
-  // ── Step l: Return SSE response ───────────────────────────────────────────
   return new Response(sseStream, {
     headers: {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      // Ephemeral mode has no thread — omit the header to avoid leaking an empty string
       ...(ephemeral ? {} : { 'X-Thread-Id': threadId }),
     },
   })
 }
+
+export const POST = withStreamingErrorHandler(handlePost)

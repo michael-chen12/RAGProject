@@ -1,35 +1,34 @@
+import { NextRequest } from 'next/server'
 import { createClient, createServiceClient } from '@/lib/supabase/server'
 import { getEvalCasesForSet, insertEvalRun } from '@/lib/queries/eval'
 import { runEvalCase, type EvalCaseResult } from '@/lib/eval/runner'
 import type { Json } from '@/types/database.types'
+import { withStreamingErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
 
 export const maxDuration = 60 // Vercel max: 60s on hobby, 300s on pro
 
-export async function POST(request: Request): Promise<Response> {
-  // ── 1. Auth ───────────────────────────────────────────────────────────────
+async function handlePost(request: NextRequest): Promise<Response> {
+  const requestId = request.headers.get('x-internal-request-id') ?? ''
+
   const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id })
 
-  if (!user) {
-    return Response.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  // ── 2. Parse body ─────────────────────────────────────────────────────────
   let body: { evalSetId?: string; workspaceId?: string }
   try {
     body = await request.json()
   } catch {
-    return Response.json({ error: 'Invalid JSON' }, { status: 400 })
+    throw Errors.invalidJson()
   }
 
   const { evalSetId, workspaceId } = body
   if (!evalSetId || !workspaceId) {
-    return Response.json({ error: 'evalSetId and workspaceId are required' }, { status: 400 })
+    throw Errors.validation('evalSetId and workspaceId are required')
   }
 
-  // ── 3. RBAC: admin only ────────────────────────────────────────────────────
   const { data: membership } = await supabase
     .from('memberships')
     .select('role, workspace_id')
@@ -37,23 +36,17 @@ export async function POST(request: Request): Promise<Response> {
     .eq('user_id', user.id)
     .single()
 
-  if (!membership) {
-    return Response.json({ error: 'Forbidden' }, { status: 403 })
-  }
+  if (!membership) throw Errors.forbidden()
+  if (membership.role !== 'admin') throw Errors.forbidden('Admin role required')
 
-  if (membership.role !== 'admin') {
-    return Response.json({ error: 'Admin role required' }, { status: 403 })
-  }
+  setLogContext(requestId, { workspaceId: membership.workspace_id })
 
-  // ── 4. Fetch eval cases ───────────────────────────────────────────────────
   const serviceClient = createServiceClient()
   const cases = await getEvalCasesForSet(serviceClient, evalSetId)
 
-  if (cases.length === 0) {
-    return Response.json({ error: 'No eval cases found for this set' }, { status: 404 })
-  }
+  if (cases.length === 0) throw Errors.notFound('No eval cases found for this set')
 
-  // ── 5. Stream NDJSON progress ─────────────────────────────────────────────
+  // Stream NDJSON progress
   const encoder = new TextEncoder()
   const results: EvalCaseResult[] = []
 
@@ -63,7 +56,6 @@ export async function POST(request: Request): Promise<Response> {
         for (let i = 0; i < cases.length; i++) {
           const evalCase = cases[i]
 
-          // Send progress event BEFORE running this case
           const progressEvent = JSON.stringify({
             type: 'progress',
             current: i,
@@ -71,16 +63,13 @@ export async function POST(request: Request): Promise<Response> {
           })
           controller.enqueue(encoder.encode(progressEvent + '\n'))
 
-          // Run case sequentially (respect OpenAI rate limits)
           const result = await runEvalCase(serviceClient, workspaceId, evalCase)
           results.push(result)
         }
 
-        // ── 6. Compute aggregated metrics ─────────────────────────────────
         const recallAtK = results.filter((r) => r.recallHit).length / results.length
         const answerAccuracy = results.reduce((sum, r) => sum + r.llmScore, 0) / results.length
 
-        // ── 7. Persist eval run ────────────────────────────────────────────
         const evalRun = await insertEvalRun(serviceClient, {
           eval_set_id: evalSetId,
           recall_at_k: recallAtK,
@@ -89,7 +78,6 @@ export async function POST(request: Request): Promise<Response> {
           details: results as unknown as Json,
         })
 
-        // ── 8. Send completion event ──────────────────────────────────────
         const completeEvent = JSON.stringify({
           type: 'complete',
           runId: evalRun.id,
@@ -117,3 +105,5 @@ export async function POST(request: Request): Promise<Response> {
     },
   })
 }
+
+export const POST = withStreamingErrorHandler(handlePost)

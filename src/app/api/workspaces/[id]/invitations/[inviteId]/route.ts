@@ -1,19 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient, createServiceClient } from '@/lib/supabase/server'
+import { withErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
 
-type RouteContext = { params: Promise<{ id: string; inviteId: string }> }
+type RouteContext = { params?: Promise<Record<string, string>> }
 
-// DELETE /api/workspaces/[id]/invitations/[inviteId] — revoke an invitation
-export async function DELETE(_req: NextRequest, { params }: RouteContext) {
-  const { id: workspaceId, inviteId } = await params
+async function handleDelete(req: NextRequest, { params }: RouteContext) {
+  const { id: workspaceId, inviteId } = ((await params) ?? {}) as Record<string, string>
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
 
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id, workspaceId })
 
-  // Verify admin
   const { data: membership } = await supabase
     .from('memberships')
     .select('role')
@@ -21,11 +22,8 @@ export async function DELETE(_req: NextRequest, { params }: RouteContext) {
     .eq('user_id', user.id)
     .single()
 
-  if (!membership || membership.role !== 'admin') {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
+  if (!membership || membership.role !== 'admin') throw Errors.forbidden()
 
-  // Use service client to bypass RLS for deletion
   const serviceClient = createServiceClient()
   const { error } = await serviceClient
     .from('invitations')
@@ -33,9 +31,9 @@ export async function DELETE(_req: NextRequest, { params }: RouteContext) {
     .eq('id', inviteId)
     .eq('workspace_id', workspaceId)
 
-  if (error) {
-    return NextResponse.json({ error: 'Failed to revoke invitation' }, { status: 500 })
-  }
+  if (error) throw Errors.internal('Failed to revoke invitation')
 
   return NextResponse.json({ success: true })
 }
+
+export const DELETE = withErrorHandler(handleDelete)

@@ -1,21 +1,24 @@
+import { NextRequest } from 'next/server'
 import { createClient, createServiceClient } from '@/lib/supabase/server'
 import { getTicket, getTicketMessages } from '@/lib/queries/tickets'
+import { withErrorHandler } from '@/lib/api/with-error-handler'
+import { Errors } from '@/lib/api/errors'
+import { setLogContext } from '@/lib/api/logger'
 
-type RouteContext = { params: Promise<{ id: string }> }
+type RouteContext = { params?: Promise<Record<string, string>> }
 
-// GET /api/tickets/[id]/messages?workspaceId=<id>
-export async function GET(request: Request, { params }: RouteContext) {
-  const { id: ticketId } = await params
+async function handleGet(req: NextRequest, { params }: RouteContext) {
+  const { id: ticketId } = ((await params) ?? {}) as Record<string, string>
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
 
-  // ── Auth ──────────────────────────────────────────────────────────────────
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 })
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id })
 
-  const workspaceId = new URL(request.url).searchParams.get('workspaceId')
-  if (!workspaceId) return Response.json({ error: 'workspaceId is required' }, { status: 400 })
+  const workspaceId = new URL(req.url).searchParams.get('workspaceId')
+  if (!workspaceId) throw Errors.validation('workspaceId is required')
 
-  // ── Membership check ──────────────────────────────────────────────────────
   const { data: membership } = await supabase
     .from('memberships')
     .select('workspace_id, role')
@@ -23,43 +26,42 @@ export async function GET(request: Request, { params }: RouteContext) {
     .eq('user_id', user.id)
     .single()
 
-  if (!membership) return Response.json({ error: 'Forbidden' }, { status: 403 })
-  if (membership.role === 'viewer') return Response.json({ error: 'Forbidden' }, { status: 403 })
+  if (!membership) throw Errors.forbidden()
+  if (membership.role === 'viewer') throw Errors.forbidden()
 
-  // ── Verify ticket ownership before fetching messages ──────────────────────
+  setLogContext(requestId, { workspaceId: membership.workspace_id })
+
   const ticket = await getTicket(supabase, ticketId, membership.workspace_id)
-  if (!ticket) return Response.json({ error: 'Not found' }, { status: 404 })
+  if (!ticket) throw Errors.notFound()
 
   const messages = await getTicketMessages(supabase, ticketId)
   return Response.json(messages)
 }
 
-// POST /api/tickets/[id]/messages — add a reply
-// Body: { workspaceId, content }
-export async function POST(request: Request, { params }: RouteContext) {
-  const { id: ticketId } = await params
+async function handlePost(req: NextRequest, { params }: RouteContext) {
+  const { id: ticketId } = ((await params) ?? {}) as Record<string, string>
+  const requestId = req.headers.get('x-internal-request-id') ?? ''
 
-  // ── Auth ──────────────────────────────────────────────────────────────────
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 })
+  if (!user) throw Errors.unauthorized()
+  setLogContext(requestId, { userId: user.id })
 
   let body: { workspaceId?: string; content?: string }
   try {
-    body = await request.json()
+    body = await req.json()
   } catch {
-    return Response.json({ error: 'Invalid JSON' }, { status: 400 })
+    throw Errors.invalidJson()
   }
 
   const { workspaceId, content } = body
   if (!workspaceId || typeof workspaceId !== 'string') {
-    return Response.json({ error: 'workspaceId is required' }, { status: 400 })
+    throw Errors.validation('workspaceId is required')
   }
   if (!content || typeof content !== 'string' || content.trim().length === 0) {
-    return Response.json({ error: 'content is required' }, { status: 400 })
+    throw Errors.validation('content is required')
   }
 
-  // ── Membership + role check ───────────────────────────────────────────────
   const { data: membership } = await supabase
     .from('memberships')
     .select('workspace_id, role')
@@ -67,28 +69,30 @@ export async function POST(request: Request, { params }: RouteContext) {
     .eq('user_id', user.id)
     .single()
 
-  if (!membership) return Response.json({ error: 'Forbidden' }, { status: 403 })
-  if (membership.role === 'viewer') return Response.json({ error: 'Forbidden' }, { status: 403 })
+  if (!membership) throw Errors.forbidden()
+  if (membership.role === 'viewer') throw Errors.forbidden()
 
-  // ── Verify ticket ownership ───────────────────────────────────────────────
+  setLogContext(requestId, { workspaceId: membership.workspace_id })
+
   const ticket = await getTicket(supabase, ticketId, membership.workspace_id)
-  if (!ticket) return Response.json({ error: 'Not found' }, { status: 404 })
+  if (!ticket) throw Errors.notFound()
 
-  // ── Insert with author_id from verified auth — NEVER from request body ─────
+  // Insert with author_id from verified auth — NEVER from request body
   const serviceClient = createServiceClient()
   const { data: message, error } = await serviceClient
     .from('ticket_messages')
     .insert({
       ticket_id: ticketId,
       content: content.trim(),
-      author_id: user.id,  // Always from auth session
+      author_id: user.id, // Always from auth session
     })
     .select()
     .single()
 
-  if (error || !message) {
-    return Response.json({ error: 'Failed to add message' }, { status: 500 })
-  }
+  if (error || !message) throw Errors.internal('Failed to add message')
 
   return Response.json(message, { status: 201 })
 }
+
+export const GET = withErrorHandler(handleGet)
+export const POST = withErrorHandler(handlePost)
