@@ -34,7 +34,7 @@ export interface RetrievalOptions {
  *
  * @param supabase  Service-role client (required for SECURITY DEFINER RPC)
  * @param workspaceId  Validated workspace ID from membership check
- * @param queryEmbedding  1536-dim float array from embedText()
+ * @param queryEmbedding  768-dim float array from embedText()
  * @param options  Optional filters and tuning parameters
  */
 export async function retrieveChunks(

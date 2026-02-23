@@ -5,7 +5,7 @@
 // It is rendered inside <Suspense> on the ticket detail page.
 
 import { createServiceClient } from '@/lib/supabase/server'
-import { embedText } from '@/lib/openai/embeddings'
+import { embedText } from '@/lib/gemini'
 import { retrieveChunks } from '@/lib/rag/retrieval'
 
 interface AiSuggestionPanelProps {

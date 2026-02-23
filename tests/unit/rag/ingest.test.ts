@@ -1,7 +1,7 @@
 /**
  * Unit tests for the document ingestion pipeline.
  * Tests cover: chunk count, overlap correctness, trailing chunk discard,
- * empty input, and embedding dimension via a mocked OpenAI client.
+ * empty input, and embedding dimension via a mocked Gemini client.
  */
 
 // ── Mock tiktoken so tests run without the WASM binary ───────────────────────
@@ -20,19 +20,23 @@ jest.mock('tiktoken', () => {
   return { get_encoding: jest.fn(() => enc) }
 })
 
-// ── Mock OpenAI client ────────────────────────────────────────────────────────
-jest.mock('openai', () => {
-  return jest.fn().mockImplementation(() => ({
-    embeddings: {
-      create: jest.fn().mockImplementation(({ input }: { input: string[] }) => ({
-        data: input.map(() => ({ embedding: new Array(1536).fill(0) })),
+// ── Mock Gemini client ────────────────────────────────────────────────────────
+// Mock the client module to bypass API key check
+jest.mock('@/lib/gemini/client', () => ({
+  getGeminiClient: jest.fn().mockReturnValue({
+    getGenerativeModel: jest.fn().mockReturnValue({
+      batchEmbedContents: jest.fn().mockImplementation(({ requests }: { requests: Array<{ content: { parts: Array<{ text: string }> } }> }) => ({
+        embeddings: requests.map(() => ({ values: new Array(768).fill(0) })),
       })),
-    },
-  }))
-})
+      embedContent: jest.fn().mockImplementation(() => ({
+        embedding: { values: new Array(768).fill(0) },
+      })),
+    }),
+  }),
+}))
 
 import { chunkDocument } from '@/lib/rag/ingest'
-import { embedChunks } from '@/lib/openai/embeddings'
+import { embedChunks } from '@/lib/gemini/embeddings'
 
 // ── chunkDocument ─────────────────────────────────────────────────────────────
 
@@ -122,7 +126,7 @@ describe('chunkDocument', () => {
 // ── embedChunks ───────────────────────────────────────────────────────────────
 
 describe('embedChunks', () => {
-  it('returns embedding arrays of length 1536', async () => {
+  it('returns embedding arrays of length 768', async () => {
     const chunks = [
       { text: 'hello', tokenCount: 1, chunkIndex: 0 },
       { text: 'world', tokenCount: 1, chunkIndex: 1 },
@@ -130,7 +134,7 @@ describe('embedChunks', () => {
     const result = await embedChunks(chunks)
     expect(result).toHaveLength(2)
     result.forEach((r) => {
-      expect(r.embedding).toHaveLength(1536)
+      expect(r.embedding).toHaveLength(768)
     })
   })
 

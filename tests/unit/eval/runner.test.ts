@@ -6,32 +6,18 @@
 // ── Mocks must be defined before imports ──────────────────────────────────────
 const mockEmbedText = jest.fn()
 const mockRetrieveChunks = jest.fn()
-const mockCreate = jest.fn()
 const mockStreamChatResponse = jest.fn()
+const mockChatCompletion = jest.fn()
 
-jest.mock('@/lib/openai/embeddings', () => ({
+jest.mock('@/lib/gemini', () => ({
   embedText: (...args: unknown[]) => mockEmbedText(...args),
+  streamChatResponse: (...args: unknown[]) => mockStreamChatResponse(...args),
+  chatCompletion: (...args: unknown[]) => mockChatCompletion(...args),
+  EMBEDDING_DIMENSIONS: 768,
 }))
 
 jest.mock('@/lib/rag/retrieval', () => ({
   retrieveChunks: (...args: unknown[]) => mockRetrieveChunks(...args),
-}))
-
-jest.mock('openai', () => {
-  return {
-    __esModule: true,
-    default: class MockOpenAI {
-      chat = {
-        completions: {
-          create: (...args: unknown[]) => mockCreate(...args),
-        },
-      }
-    },
-  }
-})
-
-jest.mock('@/lib/openai/chat', () => ({
-  streamChatResponse: (...args: unknown[]) => mockStreamChatResponse(...args),
 }))
 
 jest.mock('@/lib/rag/prompt', () => ({
@@ -63,13 +49,11 @@ describe('runEvalCase', () => {
   })
 
   it('returns recall hit=true when expected_source_id appears in retrieved chunks', async () => {
-    mockEmbedText.mockResolvedValue(new Array(1536).fill(0.1))
+    mockEmbedText.mockResolvedValue(new Array(768).fill(0.1))
     mockRetrieveChunks.mockResolvedValue([
       { id: 'chunk-abc', chunkText: 'Refunds within 30 days', similarity: 0.9, documentId: 'doc-1', workspaceId: 'ws-1', collectionId: null, chunkIndex: 0, filename: 'policy.md' },
     ])
-    mockCreate.mockResolvedValue({
-      choices: [{ message: { content: '{"score": 0.9}' } }],
-    })
+    mockChatCompletion.mockResolvedValue('{"score": 0.9}')
 
     const result = await runEvalCase(supabase, workspaceId, {
       id: 'case-1',
@@ -85,13 +69,11 @@ describe('runEvalCase', () => {
   })
 
   it('returns recall hit=false when expected_source_id is NOT in retrieved chunks', async () => {
-    mockEmbedText.mockResolvedValue(new Array(1536).fill(0.1))
+    mockEmbedText.mockResolvedValue(new Array(768).fill(0.1))
     mockRetrieveChunks.mockResolvedValue([
       { id: 'chunk-xyz', chunkText: 'Something else', similarity: 0.7, documentId: 'doc-2', workspaceId: 'ws-1', collectionId: null, chunkIndex: 0, filename: 'other.md' },
     ])
-    mockCreate.mockResolvedValue({
-      choices: [{ message: { content: '{"score": 0.2}' } }],
-    })
+    mockChatCompletion.mockResolvedValue('{"score": 0.2}')
 
     const result = await runEvalCase(supabase, workspaceId, {
       id: 'case-2',
@@ -106,11 +88,9 @@ describe('runEvalCase', () => {
   })
 
   it('handles malformed LLM judge response by defaulting score to 0', async () => {
-    mockEmbedText.mockResolvedValue(new Array(1536).fill(0))
+    mockEmbedText.mockResolvedValue(new Array(768).fill(0))
     mockRetrieveChunks.mockResolvedValue([])
-    mockCreate.mockResolvedValue({
-      choices: [{ message: { content: 'not json' } }],
-    })
+    mockChatCompletion.mockResolvedValue('not json')
 
     const result = await runEvalCase(supabase, workspaceId, {
       id: 'case-3',
@@ -124,13 +104,11 @@ describe('runEvalCase', () => {
   })
 
   it('returns recall hit=false when expected_source_ids is empty', async () => {
-    mockEmbedText.mockResolvedValue(new Array(1536).fill(0.1))
+    mockEmbedText.mockResolvedValue(new Array(768).fill(0.1))
     mockRetrieveChunks.mockResolvedValue([
       { id: 'chunk-xyz', chunkText: 'Some content', similarity: 0.8, documentId: 'doc-1', workspaceId: 'ws-1', collectionId: null, chunkIndex: 0, filename: 'doc.md' },
     ])
-    mockCreate.mockResolvedValue({
-      choices: [{ message: { content: '{"score": 0.5}' } }],
-    })
+    mockChatCompletion.mockResolvedValue('{"score": 0.5}')
 
     const result = await runEvalCase(supabase, workspaceId, {
       id: 'case-4',
@@ -145,11 +123,9 @@ describe('runEvalCase', () => {
   })
 
   it('clamps LLM score to 0-1 range', async () => {
-    mockEmbedText.mockResolvedValue(new Array(1536).fill(0.1))
+    mockEmbedText.mockResolvedValue(new Array(768).fill(0.1))
     mockRetrieveChunks.mockResolvedValue([])
-    mockCreate.mockResolvedValue({
-      choices: [{ message: { content: '{"score": 1.5}' } }],
-    })
+    mockChatCompletion.mockResolvedValue('{"score": 1.5}')
 
     const result = await runEvalCase(supabase, workspaceId, {
       id: 'case-5',
