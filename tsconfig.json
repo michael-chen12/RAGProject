@@ -39,6 +39,7 @@
     "node_modules",
     "playwright.config.ts",
     "tests/e2e",
-    "supabase/functions"
+    "supabase/functions",
+    "scripts"
   ]
 }
