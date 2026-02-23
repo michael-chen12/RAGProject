@@ -1,13 +1,13 @@
 /**
  * Gemini Embeddings
  *
- * Provides text embedding using Google's text-embedding-004 model (768 dimensions).
+ * Provides text embedding using Google's gemini-embedding-001 model (768 dimensions).
  */
 
 import { getGeminiClient } from './client'
 import type { Chunk } from '@/lib/rag/ingest'
 
-const EMBEDDING_MODEL = 'text-embedding-004'
+const EMBEDDING_MODEL = 'gemini-embedding-001'
 const BATCH_SIZE = 100
 
 /**
